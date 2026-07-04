@@ -1,0 +1,3 @@
+_target_: evals.models.probes.Box3DHead
+min_depth: 0.1
+max_depth: 80.0

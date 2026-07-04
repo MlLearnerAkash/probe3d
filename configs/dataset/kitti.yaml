@@ -1,0 +1,7 @@
+_target_: evals.datasets.kitti.KITTI
+split: train
+image_mean: imagenet
+image_size: [384, 1280]
+augment_train: True
+classes: ["Car", "Pedestrian", "Cyclist"]
+max_depth: 80.0

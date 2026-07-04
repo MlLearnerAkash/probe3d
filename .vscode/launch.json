@@ -1,0 +1,24 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train Box3D (KITTI)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_box3d.py",
+            "console": "integratedTerminal",
+            "python": "/home/akashmanna/miniconda3/envs/vlg_eval312/bin/python",
+            "args": [
+                "--config-dir", "configs",
+                "--config-name", "box3d_training",
+                "system.num_gpus=1"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "0",
+                "HYDRA_FULL_ERROR": "1"
+            },
+            "justMyCode": false
+        },
+    ]
+}

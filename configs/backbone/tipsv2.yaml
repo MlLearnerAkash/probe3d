@@ -1,0 +1,5 @@
+_target_: evals.models.tipsv2.TIPS
+variant: L
+img_size: 448
+output: dense-cls
+layer: -1
