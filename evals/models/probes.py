@@ -271,3 +271,253 @@ class MultiscaleHead(nn.Module):
         feats = self.conv_mid(feats).relu()
         feats = interpolate(feats, scale_factor=4, mode="bilinear", align_corners=True)
         return self.conv_out(feats)
+
+
+# ============================================================================
+# FCOS3D-style 3D Bounding Box Probe (mmdet3d anchor_free_mono3d_head)
+# ============================================================================
+
+class ConvBlock(nn.Sequential):
+    def __init__(self, in_ch, out_ch):
+        super().__init__(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(32, out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+
+class Box3DHead(nn.Module):
+
+    def __init__(
+        self,
+        feat_dim,
+        feat_channels=256,
+        stacked_convs=4,
+        base_depth=None,
+        base_dims=None,
+        min_depth=0.1,
+        max_depth=80.0,
+        head_type=None,       # ignored; kept for config compatibility
+        hidden_dim=None,      # ignored
+        kernel_size=None,     # ignored
+    ):
+        super().__init__()
+
+        self.name = "box3d_fcos"
+
+        self.cls_convs = nn.ModuleList()
+        for i in range(stacked_convs):
+            in_ch = feat_dim if i == 0 else feat_channels
+            self.cls_convs.append(ConvBlock(in_ch, feat_channels))
+
+        self.reg_convs = nn.ModuleList()
+        for i in range(stacked_convs):
+            in_ch = feat_dim if i == 0 else feat_channels
+            self.reg_convs.append(ConvBlock(in_ch, feat_channels))
+
+        self.obj_branch = nn.Sequential(
+            ConvBlock(feat_channels, 128),
+            ConvBlock(128, 64),
+            nn.Conv2d(64, 1, 1),
+        )
+        self.offset_branch = nn.Sequential(
+            ConvBlock(feat_channels, 128),
+            ConvBlock(128, 64),
+            nn.Conv2d(64, 2, 1),
+        )
+        self.depth_branch = nn.Sequential(
+            ConvBlock(feat_channels, 128),
+            ConvBlock(128, 64),
+            nn.Conv2d(64, 1, 1),
+        )
+        self.dims_branch = nn.Sequential(
+            ConvBlock(feat_channels, 64),
+            nn.Conv2d(64, 3, 1),
+        )
+        self.yaw_branch = nn.Sequential(
+            ConvBlock(feat_channels, 64),
+            nn.Conv2d(64, 2, 1),
+        )
+        self.dir_branch = nn.Sequential(
+            ConvBlock(feat_channels, 64),
+            nn.Conv2d(64, 1, 1),
+        )
+
+        self.base_depth = base_depth
+        self.base_dims = base_dims
+        self.min_depth = min_depth
+        self.max_depth = max_depth
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for modules in [self.cls_convs, self.reg_convs,
+                        self.obj_branch, self.offset_branch,
+                        self.depth_branch, self.dims_branch,
+                        self.yaw_branch, self.dir_branch]:
+            for m in modules.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.normal_(m.weight, std=0.01)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        cls_feat = x
+        reg_feat = x
+        for conv in self.cls_convs:
+            cls_feat = conv(cls_feat)
+        for conv in self.reg_convs:
+            reg_feat = conv(reg_feat)
+
+        obj = self.obj_branch(cls_feat)
+        offset = self.offset_branch(reg_feat)
+        depth = self.depth_branch(reg_feat)
+        dims = self.dims_branch(reg_feat)
+        yaw = self.yaw_branch(reg_feat)
+        dir_cls = self.dir_branch(reg_feat)
+
+        return torch.cat([obj, offset, depth, dims, yaw, dir_cls], dim=1)
+
+    def decode_boxes(
+        self,
+        pred_dense,
+        intrinsics,
+        stride=16,
+        topk=100,
+        score_thresh=0.05,
+        class_priors=None,  # (B,) class indices for multi-class priors
+    ):
+        """
+        Decode dense predictions into 3D boxes (FCOS3D-style).
+
+        Args:
+            pred_dense:   (B, 10, H, W) raw output from forward()
+            intrinsics:   (B, 3, 3) camera intrinsics K
+            stride:       feature stride relative to input image
+            topk:         max detections to return
+            score_thresh: minimum objectness score
+
+        Returns:
+            boxes_3d: (B, topk, 7) — [X, Y, Z, W, H, L, θ] in camera coords
+            scores:   (B, topk)    — objectness scores
+            labels:   (B, topk)    — class labels (from dir_cls for now)
+        """
+        B, C, H, W = pred_dense.shape
+        assert C == 10, f"Expected 10 channels, got {C}"
+
+        # --- split channels ---
+        obj_logits  = pred_dense[:, 0:1, :, :]     # (B, 1, H, W)
+        offset_2d   = pred_dense[:, 1:3, :, :]     # (B, 2, H, W)
+        depth_raw   = pred_dense[:, 3:4, :, :]     # (B, 1, H, W)
+        dims_raw    = pred_dense[:, 4:7, :, :]     # (B, 3, H, W)
+        yaw_sincos  = pred_dense[:, 7:9, :, :]     # (B, 2, H, W)
+        dir_logits  = pred_dense[:, 9:10, :, :]    # (B, 1, H, W)
+
+        # --- objectness: sigmoid → flatten → top-k ---
+        obj_scores = obj_logits.sigmoid().squeeze(1)  # (B, H, W)
+        obj_flat = obj_scores.view(B, -1)              # (B, H*W)
+
+        if topk > H * W:
+            topk = H * W
+
+        topk_scores, topk_indices = obj_flat.topk(topk, dim=1)  # (B, K)
+
+        # build grid of pixel coords
+        device = pred_dense.device
+        ys = torch.arange(H, device=device).float()
+        xs = torch.arange(W, device=device).float()
+        y_grid, x_grid = torch.meshgrid(ys, xs, indexing="ij")  # (H, W)
+        x_grid = x_grid.unsqueeze(0).expand(B, -1, -1)          # (B, H, W)
+        y_grid = y_grid.unsqueeze(0).expand(B, -1, -1)
+
+        # --- gather predictions at top-k locations ---
+        topk_x = x_grid.reshape(B, -1).gather(1, topk_indices)  # (B, K)
+        topk_y = y_grid.reshape(B, -1).gather(1, topk_indices)  # (B, K)
+
+        def gather(feat):
+            return feat.view(B, feat.shape[1], -1).gather(2,
+                topk_indices.unsqueeze(1).expand(-1, feat.shape[1], -1)
+            )  # (B, C, K)
+
+        topk_offset = gather(offset_2d)       # (B, 2, K)
+        topk_depth  = gather(depth_raw)       # (B, 1, K)
+        topk_dims   = gather(dims_raw)        # (B, 3, K)
+        topk_yaw    = gather(yaw_sincos)      # (B, 2, K)
+        topk_dir    = gather(dir_logits)      # (B, 1, K)
+
+        # --- 1. Projected 3D center on image ---
+        u_3d = (topk_x + topk_offset[:, 0, :]) * stride  # (B, K)
+        v_3d = (topk_y + topk_offset[:, 1, :]) * stride  # (B, K)
+
+        # --- 2. Decode depth Z ---
+        depth = topk_depth[:, 0, :]  # (B, K)
+        if self.base_depth is not None:
+            if isinstance(self.base_depth, list) and class_priors is not None:
+                # multi-class priors
+                mu = torch.tensor(
+                    [self.base_depth[c][0] for c in class_priors],
+                    device=device
+                ).view(B, 1)
+                std = torch.tensor(
+                    [self.base_depth[c][1] for c in class_priors],
+                    device=device
+                ).view(B, 1)
+                z = mu + depth * std
+            else:
+                mu, std = self.base_depth
+                z = mu + depth * std
+        else:
+            z = depth.exp()  # log-space
+
+        z = z.clamp(min=self.min_depth, max=self.max_depth)
+
+        # --- 3. Back-project to 3D camera coords ---
+        fx = intrinsics[:, 0, 0].view(B, 1)  # (B, 1)
+        fy = intrinsics[:, 1, 1].view(B, 1)
+        cx = intrinsics[:, 0, 2].view(B, 1)
+        cy = intrinsics[:, 1, 2].view(B, 1)
+
+        X = (u_3d - cx) * z / fx  # (B, K)
+        Y = (v_3d - cy) * z / fy  # (B, K)
+        Z = z                      # (B, K)
+
+        # --- 4. Decode dimensions ---
+        dims = topk_dims.permute(0, 2, 1)  # (B, K, 3)
+        W_box = dims[..., 0].exp()
+        H_box = dims[..., 1].exp()
+        L_box = dims[..., 2].exp()
+
+        if self.base_dims is not None:
+            if isinstance(self.base_dims, list) and class_priors is not None:
+                base = torch.tensor(
+                    [self.base_dims[c] for c in class_priors], device=device
+                )  # (B, 3)
+                W_box = W_box * base[:, 0:1]
+                H_box = H_box * base[:, 1:2]
+                L_box = L_box * base[:, 2:3]
+            else:
+                bw, bh, bl = self.base_dims
+                W_box = W_box * bw
+                H_box = H_box * bh
+                L_box = L_box * bl
+
+        # --- 5. Decode yaw ---
+        sin_a = topk_yaw[:, 0, :]  # (B, K)
+        cos_a = topk_yaw[:, 1, :]  # (B, K)
+        # normalize
+        norm = torch.sqrt(sin_a**2 + cos_a**2 + 1e-6)
+        sin_a = sin_a / norm
+        cos_a = cos_a / norm
+        alpha = torch.atan2(sin_a, cos_a)  # local observation angle
+
+        # direction classifier: if dir_logits > 0 then back (add pi)
+        dir_cls = (topk_dir[:, 0, :] > 0).float()  # (B, K)
+        alpha = alpha + dir_cls * torch.pi
+
+        # global yaw: θ = α + arctan2(u_3d - c_u, f_u)
+        theta = alpha + torch.atan2(u_3d - cx, fx)
+
+        # --- assemble ---
+        boxes_3d = torch.stack([X, Y, Z, W_box, H_box, L_box, theta], dim=-1)  # (B, K, 7)
+
+        return boxes_3d, topk_scores, dir_cls.long()

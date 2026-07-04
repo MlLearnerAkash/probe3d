@@ -34,7 +34,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 
-def build_loader(cfg, split, batch_size, num_gpus=1, **kwargs):
+def build_loader(cfg, split, batch_size, num_gpus=1, collate_fn=None, **kwargs):
     """
     Build a PyTorch dataloader and the underlying dataset (using config).
     """
@@ -54,6 +54,7 @@ def build_loader(cfg, split, batch_size, num_gpus=1, **kwargs):
         pin_memory=True,
         shuffle=shuffle,
         sampler=sampler,
+        collate_fn=collate_fn,
     )
 
     return loader

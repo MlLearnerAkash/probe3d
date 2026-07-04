@@ -171,3 +171,212 @@ def match_scale_and_shift(prediction, target):
     prediction = prediction * scale + shift
 
     return prediction[:, None, :, :] if four_chan else prediction
+
+
+# ============================================================================
+# 3D Bounding Box Metrics
+# ============================================================================
+
+
+def evaluate_box3d(pred_boxes, pred_scores, gt_boxes, iou_thresholds=None):
+    """
+    Compute 3D detection metrics: AP, translation error, dimension error, yaw error.
+
+    Args:
+        pred_boxes:  (N_pred, 7) tensor [X, Y, Z, W, H, L, θ]
+        pred_scores: (N_pred,) confidence scores
+        gt_boxes:    (N_gt, 7) ground truth boxes
+        iou_thresholds: list of IoU thresholds for AP (default [0.5, 0.7])
+
+    Returns:
+        dict with: ap_3d_xx, center_err, dim_err, yaw_err
+    """
+    if iou_thresholds is None:
+        iou_thresholds = [0.5, 0.7]
+
+    N_pred = pred_boxes.shape[0]
+    N_gt = gt_boxes.shape[0]
+
+    if N_pred == 0 or N_gt == 0:
+        metrics = {}
+        for t in iou_thresholds:
+            metrics[f"ap_3d_{t}"] = 0.0
+        metrics["center_err"] = 0.0
+        metrics["dim_err"] = 0.0
+        metrics["yaw_err"] = 0.0
+        return metrics
+
+    # sort by score descending
+    sorted_idx = pred_scores.argsort(descending=True)
+    pred_boxes = pred_boxes[sorted_idx]
+    pred_scores = pred_scores[sorted_idx]
+
+    # compute IoU matrix
+    iou_matrix = _compute_iou3d(pred_boxes, gt_boxes)  # (N_pred, N_gt)
+
+    matched_gt = set()
+    tp = {t: torch.zeros(N_pred, device=pred_boxes.device) for t in iou_thresholds}
+    fp = {t: torch.zeros(N_pred, device=pred_boxes.device) for t in iou_thresholds}
+
+    for i in range(N_pred):
+        best_iou, best_j = iou_matrix[i].max(dim=0)
+        for t in iou_thresholds:
+            if best_iou >= t and best_j.item() not in matched_gt:
+                tp[t][i] = 1
+                matched_gt.add(best_j.item())
+            else:
+                fp[t][i] = 1
+
+    metrics = {}
+    for t in iou_thresholds:
+        tp_cum = tp[t].cumsum(dim=0)
+        fp_cum = fp[t].cumsum(dim=0)
+        recall = tp_cum / max(N_gt, 1)
+        precision = tp_cum / (tp_cum + fp_cum).clamp(min=1)
+
+        # 11-point interpolated AP
+        ap = 0.0
+        for r in torch.linspace(0, 1, 11, device=pred_boxes.device):
+            mask = recall >= r
+            if mask.any():
+                ap += precision[mask].max() / 11.0
+        metrics[f"ap_3d_{t}"] = ap.item()
+
+    # best-match errors
+    if N_gt > 0:
+        best_iou, best_match = iou_matrix.max(dim=0)  # (N_gt,)
+        # only use matches with IoU > 0.1
+        valid = best_iou > 0.1
+
+        if valid.any():
+            matched_pred = pred_boxes[best_match[valid]]
+            matched_gt   = gt_boxes[valid]
+
+            center_err = (matched_pred[:, :3] - matched_gt[:, :3]).norm(dim=1).mean()
+            dim_err    = (matched_pred[:, 3:6] - matched_gt[:, 3:6]).abs().mean()
+            yaw_diff   = matched_pred[:, 6] - matched_gt[:, 6]
+            yaw_diff   = torch.atan2(torch.sin(yaw_diff), torch.cos(yaw_diff))
+            yaw_err    = yaw_diff.abs().mean()
+
+            metrics["center_err"] = center_err.item()
+            metrics["dim_err"]    = dim_err.item()
+            metrics["yaw_err"]    = yaw_err.item()
+        else:
+            metrics["center_err"] = float("nan")
+            metrics["dim_err"]    = float("nan")
+            metrics["yaw_err"]    = float("nan")
+    else:
+        metrics["center_err"] = float("nan")
+        metrics["dim_err"]    = float("nan")
+        metrics["yaw_err"]    = float("nan")
+
+    return metrics
+
+
+def _compute_iou3d(boxes_a, boxes_b):
+    """
+    Compute BEV (bird's-eye-view) IoU between two sets of 3D boxes.
+    Approximates 3D IoU as BEV IoU × min height ratio.
+
+    Args:
+        boxes_a: (M, 7) [X, Y, Z, W, H, L, θ]
+        boxes_b: (N, 7)
+
+    Returns:
+        iou: (M, N) tensor
+    """
+    M, N = boxes_a.shape[0], boxes_b.shape[0]
+    device = boxes_a.device
+
+    iou = torch.zeros(M, N, device=device)
+
+    for i in range(M):
+        for j in range(N):
+            iou[i, j] = _bev_iou_single(
+                boxes_a[i, 0], boxes_a[i, 2], boxes_a[i, 3], boxes_a[i, 5], boxes_a[i, 6],  # X, Z, W, L, θ
+                boxes_b[j, 0], boxes_b[j, 2], boxes_b[j, 3], boxes_b[j, 5], boxes_b[j, 6],
+            )
+
+    return iou
+
+
+def _bev_iou_single(x1, z1, w1, l1, yaw1, x2, z2, w2, l2, yaw2):
+    """
+    Compute BEV IoU between two oriented 2D boxes (X-Z plane).
+    Uses triangle-area-based intersection (no shapely dependency).
+    """
+    import math
+
+    # get corners in BEV (X, Z)
+    def get_bev_corners(x, z, w, l, yaw):
+        cos_t = math.cos(yaw)
+        sin_t = math.sin(yaw)
+        # corners: front-left, front-right, back-right, back-left
+        corners_local = [
+            (-l/2, -w/2), (l/2, -w/2), (l/2, w/2), (-l/2, w/2)
+        ]
+        corners = []
+        for dx, dz in corners_local:
+            cx = x + dx * cos_t - dz * sin_t
+            cz = z + dx * sin_t + dz * cos_t
+            corners.append((cx, cz))
+        return corners
+
+    corners1 = get_bev_corners(x1, z1, w1, l1, yaw1)
+    corners2 = get_bev_corners(x2, z2, w2, l2, yaw2)
+
+    area1 = w1 * l1
+    area2 = w2 * l2
+
+    # convex polygon intersection via Sutherland-Hodgman
+    def poly_area(poly):
+        if len(poly) < 3:
+            return 0.0
+        a = 0.0
+        for i in range(len(poly)):
+            x1, y1 = poly[i]
+            x2, y2 = poly[(i + 1) % len(poly)]
+            a += x1 * y2 - x2 * y1
+        return abs(a) / 2.0
+
+    def clip_polygon(subject, clip):
+        def inside(p, cp1, cp2):
+            return (cp2[0] - cp1[0]) * (p[1] - cp1[1]) > (cp2[1] - cp1[1]) * (p[0] - cp1[0])
+
+        def intersection(s, e, cp1, cp2):
+            dc = (cp1[0] - cp2[0], cp1[1] - cp2[1])
+            dp = (s[0] - e[0], s[1] - e[1])
+            n1 = cp1[0] * cp2[1] - cp1[1] * cp2[0]
+            n2 = s[0] * e[1] - s[1] * e[0]
+            n3 = 1.0 / (dc[0] * dp[1] - dc[1] * dp[0] + 1e-10)
+            x = (n1 * dp[0] - n2 * dc[0]) * n3
+            y = (n1 * dp[1] - n2 * dc[1]) * n3
+            return (x, y)
+
+        output = subject
+        for i in range(len(clip)):
+            cp1 = clip[i]
+            cp2 = clip[(i + 1) % len(clip)]
+            input_list = output
+            output = []
+            if len(input_list) == 0:
+                break
+            s = input_list[-1]
+            for e in input_list:
+                if inside(e, cp1, cp2):
+                    if not inside(s, cp1, cp2):
+                        output.append(intersection(s, e, cp1, cp2))
+                    output.append(e)
+                elif inside(s, cp1, cp2):
+                    output.append(intersection(s, e, cp1, cp2))
+                s = e
+        return output
+
+    inter_poly = clip_polygon(corners1, corners2)
+    inter_area = poly_area(inter_poly)
+
+    union_area = area1 + area2 - inter_area
+    if union_area < 1e-6:
+        return torch.tensor(0.0, device=x1.device if isinstance(x1, torch.Tensor) else torch.device("cpu"))
+
+    return torch.tensor(inter_area / union_area)

@@ -177,3 +177,302 @@ def snorm_l1_loss(snorm_pr, snorm_gt, mask, eps=1e-4):
     if loss_mean != loss_mean:
         breakpoint()
     return loss_mean
+
+
+# ============================================================================
+# FCOS3D-style 3D Bounding Box Losses
+# ============================================================================
+
+
+def box3d_loss(
+    pred_dense,
+    gt_boxes,
+    gt_labels,
+    intrinsics,
+    stride=16,
+    loss_weights=None,
+):
+    """
+    FCOS3D-style 3D box loss.
+
+    Args:
+        pred_dense:  (B, 10, H, W) raw dense predictions from Box3DHead
+        gt_boxes:    list of (N_i, 7) tensors [X, Y, Z, W, H, L, θ] per image
+        gt_labels:   list of (N_i,) class label tensors per image
+        intrinsics:  (B, 3, 3) camera intrinsics
+        stride:      feature stride
+        loss_weights: dict with keys:
+            'center':  weight for 2D center offset L1 loss (default 1.0)
+            'depth':   weight for depth L1 loss (default 1.0)
+            'dims':    weight for dimension L1 loss (default 1.0)
+            'yaw':     weight for yaw loss (default 1.0)
+            'corner':  weight for corner loss (default 0.5)
+            'obj':     weight for objectness focal loss (default 1.0)
+
+    Returns:
+        total_loss, loss_dict
+    """
+    B, C, H, W = pred_dense.shape
+
+    if loss_weights is None:
+        loss_weights = {}
+
+    w_center = loss_weights.get("center", 1.0)
+    w_depth  = loss_weights.get("depth",  1.0)
+    w_dims   = loss_weights.get("dims",   1.0)
+    w_yaw    = loss_weights.get("yaw",    1.0)
+    w_corner = loss_weights.get("corner", 0.5)
+    w_obj    = loss_weights.get("obj",    1.0)
+
+    # split channels
+    obj_logits  = pred_dense[:, 0:1]    # (B, 1, H, W)
+    offset_2d   = pred_dense[:, 1:3]    # (B, 2, H, W)
+    depth_raw   = pred_dense[:, 3:4]    # (B, 1, H, W)
+    dims_raw    = pred_dense[:, 4:7]    # (B, 3, H, W)
+    yaw_sincos  = pred_dense[:, 7:9]    # (B, 2, H, W)
+    dir_logits  = pred_dense[:, 9:10]   # (B, 1, H, W)
+
+    fx = intrinsics[:, 0, 0]  # (B,)
+    fy = intrinsics[:, 1, 1]
+    cx = intrinsics[:, 0, 2]
+    cy = intrinsics[:, 1, 2]
+
+    # build grid
+    device = pred_dense.device
+    ys = torch.arange(H, device=device).float()
+    xs = torch.arange(W, device=device).float()
+    y_grid, x_grid = torch.meshgrid(ys, xs, indexing="ij")  # (H, W)
+
+    total_center_loss = torch.tensor(0.0, device=device)
+    total_depth_loss  = torch.tensor(0.0, device=device)
+    total_dims_loss   = torch.tensor(0.0, device=device)
+    total_yaw_loss    = torch.tensor(0.0, device=device)
+    total_corner_loss = torch.tensor(0.0, device=device)
+    total_obj_loss    = torch.tensor(0.0, device=device)
+    num_objects = 0
+
+    for b in range(B):
+        if len(gt_boxes[b]) == 0:
+            # no objects: objectness loss only (all negative)
+            target_obj = torch.zeros(1, H, W, device=device)
+            total_obj_loss += focal_loss(
+                obj_logits[b:b+1].sigmoid(), target_obj, alpha=0.25, gamma=2.0
+            )
+            continue
+
+        boxes = gt_boxes[b]  # (N, 7): [X, Y, Z, W, H, L, θ]
+        N = boxes.shape[0]
+
+        for n in range(N):
+            X_gt, Y_gt, Z_gt, W_gt, H_gt, L_gt, theta_gt = boxes[n]
+
+            # --- project 3D center to image ---
+            u_proj = fx[b] * X_gt / Z_gt + cx[b]
+            v_proj = fy[b] * Y_gt / Z_gt + cy[b]
+
+            # map to feature grid
+            u_f = u_proj / stride
+            v_f = v_proj / stride
+
+            u_idx = int(u_f.floor().clamp(0, W - 1))
+            v_idx = int(v_f.floor().clamp(0, H - 1))
+
+            # --- compute target values at this grid location ---
+            # offset: from grid cell center to projected center
+            tgt_off_u = u_f - (u_idx + 0.5)
+            tgt_off_v = v_f - (v_idx + 0.5)
+
+            # depth
+            tgt_depth = Z_gt.log()  # log-space depth
+
+            # dimensions (log-space)
+            tgt_dW = W_gt.log()
+            tgt_dH = H_gt.log()
+            tgt_dL = L_gt.log()
+
+            # yaw: compute local observation angle α
+            alpha_gt = theta_gt - torch.atan2(u_proj - cx[b], fx[b])
+
+            # normalize alpha to [-π, π]
+            alpha_gt = torch.atan2(
+                torch.sin(alpha_gt), torch.cos(alpha_gt)
+            )
+
+            tgt_sin = torch.sin(alpha_gt)
+            tgt_cos = torch.cos(alpha_gt)
+            tgt_dir = (alpha_gt.abs() > torch.pi / 2).float()  # 0=front, 1=back
+
+            # --- L1 losses at the assigned grid cell ---
+            # center offset
+            pred_off_u = offset_2d[b, 0, v_idx, u_idx]
+            pred_off_v = offset_2d[b, 1, v_idx, u_idx]
+            center_loss = (pred_off_u - tgt_off_u).abs() + (pred_off_v - tgt_off_v).abs()
+
+            # depth
+            pred_z = depth_raw[b, 0, v_idx, u_idx]
+            depth_loss = (pred_z - tgt_depth).abs()
+
+            # dimensions
+            pred_dW = dims_raw[b, 0, v_idx, u_idx]
+            pred_dH = dims_raw[b, 1, v_idx, u_idx]
+            pred_dL = dims_raw[b, 2, v_idx, u_idx]
+            dims_loss = (pred_dW - tgt_dW).abs() + (pred_dH - tgt_dH).abs() + (pred_dL - tgt_dL).abs()
+
+            # yaw (sin/cos L1 + dir BCE)
+            pred_sin = yaw_sincos[b, 0, v_idx, u_idx]
+            pred_cos = yaw_sincos[b, 1, v_idx, u_idx]
+            yaw_l1 = (pred_sin - tgt_sin).abs() + (pred_cos - tgt_cos).abs()
+            dir_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                dir_logits[b, 0, v_idx, u_idx].unsqueeze(0),
+                tgt_dir.unsqueeze(0),
+            )
+            yaw_loss = yaw_l1 + dir_bce
+
+            # --- corner loss (project 8 corners and compute L1) ---
+            # reconstruct predicted box at this location
+            pred_Z = pred_z.exp().clamp(min=0.1)
+            pred_X = (u_idx + 0.5 + pred_off_u) * stride
+            pred_X = (pred_X - cx[b]) * pred_Z / fx[b]
+            pred_Y = (v_idx + 0.5 + pred_off_v) * stride
+            pred_Y = (pred_Y - cy[b]) * pred_Z / fy[b]
+
+            pred_W = pred_dW.exp()
+            pred_H = pred_dH.exp()
+            pred_L = pred_dL.exp()
+
+            pred_alpha = torch.atan2(pred_sin, pred_cos)
+            pred_alpha = pred_alpha + (dir_logits[b, 0, v_idx, u_idx] > 0).float() * torch.pi
+            pred_theta = pred_alpha + torch.atan2(
+                (u_idx + 0.5 + pred_off_u) * stride - cx[b], fx[b]
+            )
+
+            corners_pred = _get_3d_corners(
+                pred_X, pred_Y, pred_Z, pred_W, pred_H, pred_L, pred_theta
+            )  # (8, 3)
+            corners_gt = _get_3d_corners(
+                X_gt, Y_gt, Z_gt, W_gt, H_gt, L_gt, theta_gt
+            )  # (8, 3)
+
+            # project to image
+            corners_pred_2d = _project_points(corners_pred, intrinsics[b])  # (8, 2)
+            corners_gt_2d   = _project_points(corners_gt,   intrinsics[b])  # (8, 2)
+
+            corner_loss = (corners_pred_2d - corners_gt_2d).abs().sum() / 16.0
+
+            total_center_loss += center_loss
+            total_depth_loss  += depth_loss
+            total_dims_loss   += dims_loss
+            total_yaw_loss    += yaw_loss
+            total_corner_loss += corner_loss
+            num_objects += 1
+
+        # --- objectness target (Gaussian around each projected center) ---
+        target_obj = torch.zeros(H, W, device=device)
+        for n in range(N):
+            X_gt, Y_gt, Z_gt = boxes[n, 0], boxes[n, 1], boxes[n, 2]
+            u_proj = fx[b] * X_gt / Z_gt + cx[b]
+            v_proj = fy[b] * Y_gt / Z_gt + cy[b]
+            u_f = u_proj / stride
+            v_f = v_proj / stride
+
+            sigma = 1.5  # Gaussian sigma in grid units
+            for dy in range(-3, 4):
+                for dx in range(-3, 4):
+                    vi = int(v_f) + dy
+                    ui = int(u_f) + dx
+                    if 0 <= ui < W and 0 <= vi < H:
+                        dist2 = (ui + 0.5 - u_f)**2 + (vi + 0.5 - v_f)**2
+                        weight = torch.exp(-dist2 / (2 * sigma**2))
+                        target_obj[vi, ui] = max(target_obj[vi, ui], weight)
+
+        obj_loss = focal_loss(
+            obj_logits[b:b+1].sigmoid(),
+            target_obj.unsqueeze(0),
+            alpha=0.25,
+            gamma=2.0,
+        )
+        total_obj_loss += obj_loss
+
+    # normalize by number of objects
+    if num_objects > 0:
+        total_center_loss = total_center_loss / num_objects
+        total_depth_loss  = total_depth_loss  / num_objects
+        total_dims_loss   = total_dims_loss   / num_objects
+        total_yaw_loss    = total_yaw_loss    / num_objects
+        total_corner_loss = total_corner_loss / num_objects
+
+    total_obj_loss = total_obj_loss / B
+
+    loss_dict = {
+        "center": total_center_loss.item(),
+        "depth":  total_depth_loss.item(),
+        "dims":   total_dims_loss.item(),
+        "yaw":    total_yaw_loss.item(),
+        "corner": total_corner_loss.item(),
+        "obj":    total_obj_loss.item(),
+    }
+
+    total_loss = (
+        w_center * total_center_loss
+        + w_depth * total_depth_loss
+        + w_dims * total_dims_loss
+        + w_yaw * total_yaw_loss
+        + w_corner * total_corner_loss
+        + w_obj * total_obj_loss
+    )
+
+    return total_loss, loss_dict
+
+
+def focal_loss(pred, target, alpha=0.25, gamma=2.0):
+    """Focal loss for binary classification."""
+    eps = 1e-7
+    pred = pred.clamp(eps, 1 - eps)
+
+    pos_mask = (target > 0.5).float()
+    neg_mask = (target <= 0.5).float()
+
+    pos_loss = -alpha * pos_mask * (1 - pred).pow(gamma) * pred.log()
+    neg_loss = -(1 - alpha) * neg_mask * pred.pow(gamma) * (1 - pred).log()
+
+    # weight positive samples more
+    num_pos = pos_mask.sum().clamp(min=1)
+    num_neg = neg_mask.sum().clamp(min=1)
+
+    return pos_loss.sum() / num_pos + neg_loss.sum() / num_neg
+
+
+def _get_3d_corners(x, y, z, w, h, l, theta):
+    """Get 8 corners of a 3D box in camera coordinates."""
+    corners = torch.tensor([
+        [-1, -1, -1], [ 1, -1, -1], [ 1,  1, -1], [-1,  1, -1],
+        [-1, -1,  1], [ 1, -1,  1], [ 1,  1,  1], [-1,  1,  1],
+    ], device=x.device, dtype=x.dtype)  # (8, 3)
+
+    corners = corners * torch.tensor([l / 2, h / 2, w / 2], device=x.device, dtype=x.dtype)
+
+    cos_t = torch.cos(theta)
+    sin_t = torch.sin(theta)
+    R = torch.tensor([
+        [ cos_t, 0, sin_t],
+        [ 0,     1, 0    ],
+        [-sin_t, 0, cos_t],
+    ], device=x.device, dtype=x.dtype)
+
+    corners = corners @ R.T  # (8, 3)
+    corners = corners + torch.stack([x, y, z])
+
+    return corners
+
+
+def _project_points(points_3d, K):
+    """Project 3D points to 2D image plane."""
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    X, Y, Z = points_3d[:, 0], points_3d[:, 1], points_3d[:, 2].clamp(min=1e-6)
+
+    u = fx * X / Z + cx
+    v = fy * Y / Z + cy
+
+    return torch.stack([u, v], dim=-1)
