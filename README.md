@@ -81,3 +81,10 @@ We would also like to acknowledge the following repositories and users for relea
 code and datasets: 
 
 - [GeoNet](https://github.com/xjqi/GeoNet) for releasing the extracted surface normals for full NYU.  
+
+
+# 3D boudning box
+
+```bash
+python train_mousavian3d.py --config-dir configs --config-name mousavian3d_training<tipv2/dinov2>
+```

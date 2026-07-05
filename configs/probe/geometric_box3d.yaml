@@ -1,0 +1,3 @@
+_target_: evals.models.probes.Geometric3DProbe
+bins: 4
+image_size: [384, 1280]

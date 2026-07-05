@@ -1,0 +1,14 @@
+system:
+  random_seed: 8
+  num_gpus: 1
+  port: 12355
+note: ""
+batch_size: 4
+alpha: 0.6
+w: 2.0
+defaults:
+  - optimizer: ten_epoch
+  - backbone: tipsv2 #dinov2_b14 #tipsv2
+  - dataset: kitti
+  - probe: geometric_box3d
+  - _self_
