@@ -85,6 +85,22 @@ code and datasets:
 
 # 3D boudning box
 
+Refer: [YOLO3D](https://arxiv.org/pdf/1612.00496#page=8.41)
+### TL;DR
+- NO depth
+- Assumptions:
+  - 3D BB fits into 2D boxes(i.e constraint)
+  - Image is always upright
+  - Zero Roll and Pitch
+- 3 heads
+  - Centre
+  - Dimension
+  - Yaw
+- Classes
+  - Car
+  - pedestrian
+  - Cyclist
+
 ```bash
 python train_mousavian3d.py --config-dir configs --config-name mousavian3d_training<tipv2/dinov2>
 ```
