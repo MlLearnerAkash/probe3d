@@ -476,3 +476,71 @@ def _project_points(points_3d, K):
     v = fy * Y / Z + cy
 
     return torch.stack([u, v], dim=-1)
+
+
+# ============================================================================
+# YOLO3D Losses — exact match to https://github.com/ruhyadi/YOLO3D
+# ============================================================================
+
+
+def OrientationLoss(orient_batch, orientGT_batch, confGT_batch):
+    """
+    Orientation loss function — exact YOLO3D implementation.
+
+    Selects the correct bin (highest GT confidence), then computes
+    -cos(Δθ) between predicted and ground-truth angle within that bin.
+
+    Args:
+        orient_batch:   (N, bins, 2) predicted normalized sin/cos per bin
+        orientGT_batch: (N, bins, 2) ground truth sin/cos per bin
+        confGT_batch:   (N, bins)    ground truth confidence (one-hot bin indicator)
+
+    Returns:
+        scalar loss: -cos(θ_gt - θ_pred).mean()
+    """
+    batch_size = orient_batch.size()[0]
+    indexes = torch.max(confGT_batch, dim=1)[1]
+
+    # extract important bin
+    orientGT_batch = orientGT_batch[torch.arange(batch_size), indexes]
+    orient_batch = orient_batch[torch.arange(batch_size), indexes]
+
+    theta_diff = torch.atan2(orientGT_batch[:, 1], orientGT_batch[:, 0])
+    estimated_theta_diff = torch.atan2(orient_batch[:, 1], orient_batch[:, 0])
+
+    return -1 * torch.cos(theta_diff - estimated_theta_diff).mean()
+
+
+def build_orientation_target(alpha, bins=2):
+
+    import numpy as np
+    from evals.utils.geometric import generate_bins
+
+    device = alpha.device
+    N = alpha.size(0)
+    angle_bins = generate_bins(bins)
+    interval = 2 * np.pi / bins
+    half_range = interval / 2 + interval * 0.1  # 0.1 overlap
+
+    orient_gt = torch.zeros(N, bins, 2, device=device)
+    conf_gt = torch.zeros(N, bins, device=device)
+
+    angle = alpha + torch.pi  # [−π, π] → [0, 2π]
+
+    for i in range(N):
+        ang = angle[i].item()
+        for b_idx in range(bins):
+            bin_center = angle_bins[b_idx]
+            # Circular difference normalized to [-π, π]
+            diff = ang - bin_center
+            if diff > np.pi:
+                diff -= 2 * np.pi
+            elif diff < -np.pi:
+                diff += 2 * np.pi
+
+            if abs(diff) <= half_range:
+                orient_gt[i, b_idx, 0] = torch.cos(torch.tensor(diff))
+                orient_gt[i, b_idx, 1] = torch.sin(torch.tensor(diff))
+                conf_gt[i, b_idx] = 1.0
+
+    return orient_gt, conf_gt

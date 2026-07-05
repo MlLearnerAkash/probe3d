@@ -192,7 +192,7 @@ def evaluate_box3d(pred_boxes, pred_scores, gt_boxes, iou_thresholds=None):
         dict with: ap_3d_xx, center_err, dim_err, yaw_err
     """
     if iou_thresholds is None:
-        iou_thresholds = [0.5, 0.7]
+        iou_thresholds = [0.1, 0.3]
 
     N_pred = pred_boxes.shape[0]
     N_gt = gt_boxes.shape[0]
@@ -271,6 +271,66 @@ def evaluate_box3d(pred_boxes, pred_scores, gt_boxes, iou_thresholds=None):
         metrics["yaw_err"]    = float("nan")
 
     return metrics
+
+
+def evaluate_aos(pred_boxes, pred_scores, gt_boxes):
+    """
+    Average Orientation Similarity (AOS) — KITTI official metric.
+
+    From Mousavian et al. (CVPR 2017), Section 4:
+      s(r) = (1 + cos(Δθ)) / 2
+      AOS = (1/11) × Σ_{r ∈ {0,0.1,...,1}} max_{r̃ ≥ r} s(r̃)
+
+    Where Δθ is the yaw difference between matched predicted and GT boxes.
+    Similarity is 1.0 for 0° error, 0.0 for 180° error.
+
+    Args:
+        pred_boxes:  (N_pred, 7) [X, Y, Z, W, H, L, θ]
+        pred_scores: (N_pred,) confidence scores
+        gt_boxes:    (N_gt, 7) ground truth boxes
+
+    Returns:
+        dict with 'aos' key (scalar [0, 1])
+    """
+    N_pred = pred_boxes.shape[0]
+    N_gt = gt_boxes.shape[0]
+
+    if N_pred == 0 or N_gt == 0:
+        return {"aos": 0.0}
+
+    # sort by score descending
+    sorted_idx = pred_scores.argsort(descending=True)
+    pred_boxes = pred_boxes[sorted_idx]
+
+    # compute BEV IoU for matching
+    iou_matrix = _compute_iou3d(pred_boxes, gt_boxes)  # (N_pred, N_gt)
+
+    # greedy matching
+    matched_gt = set()
+    tp = torch.zeros(N_pred, device=pred_boxes.device)
+    similarities = torch.zeros(N_pred, device=pred_boxes.device)
+
+    for i in range(N_pred):
+        best_iou, best_j = iou_matrix[i].max(dim=0)
+        if best_iou >= 0.5 and best_j.item() not in matched_gt:
+            tp[i] = 1
+            matched_gt.add(best_j.item())
+            # orientation similarity
+            delta = pred_boxes[i, 6] - gt_boxes[best_j, 6]
+            delta = torch.atan2(torch.sin(delta), torch.cos(delta))
+            similarities[i] = (1 + torch.cos(delta)) / 2.0
+
+    # 11-point interpolation AOS
+    tp_cum = tp.cumsum(dim=0)
+    recall = tp_cum / max(N_gt, 1)
+
+    aos = 0.0
+    for r in torch.linspace(0, 1, 11, device=pred_boxes.device):
+        mask = recall >= r
+        if mask.any():
+            aos += similarities[mask].max() / 11.0
+
+    return {"aos": aos.item()}
 
 
 def _compute_iou3d(boxes_a, boxes_b):

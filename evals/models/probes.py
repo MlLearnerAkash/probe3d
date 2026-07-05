@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn.functional import interpolate
-
+import torch.nn.functional as F
 
 class SurfaceNormalHead(nn.Module):
     def __init__(
@@ -521,3 +521,197 @@ class Box3DHead(nn.Module):
         boxes_3d = torch.stack([X, Y, Z, W_box, H_box, L_box, theta], dim=-1)  # (B, K, 7)
 
         return boxes_3d, topk_scores, dir_cls.long()
+
+
+# ============================================================================
+# Geometric 3D Box Probe (Mousavian et al., CVPR 2017)
+# Probes frozen backbone features — same paradigm as depth/snorm probes
+# ============================================================================
+
+class Geometric3DProbe(nn.Module):
+    """
+    3D Box Probe using Mousavian et al. approach.
+
+    Takes dense features from a frozen backbone (TIPSv2, DINOv2, etc.),
+    crops regions at 2D object boxes via RoIAlign, then predicts:
+      - Orientation:  MultiBin sin/cos + bin confidence
+      - Dimensions:   offsets from class averages
+
+    Args:
+        feat_dim:   backbone feature channels (e.g. 1024 for TIPSv2-L dense-cls)
+        bins:       MultiBin orientation bins (default 4)
+    """
+
+    def __init__(self, feat_dim, bins=4,
+                 hidden_dim=512, conv_dim=256,
+                 image_size=None,
+                 min_depth=None, max_depth=None,
+                 head_type=None, kernel_size=None,
+                 base_depth=None, base_dims=None,
+                 checkpoint_path=None,
+                 ):
+        super().__init__()
+
+        self.name = "geometric_box3d"
+        self.bins = bins
+        self.feat_dim = feat_dim
+        self.image_size = image_size or (384, 1280)  # (H, W) for spatial_scale
+
+        # --- Conv head: C → 256 → 512 → flatten ---
+        self.conv_head = nn.Sequential(
+            nn.Conv2d(feat_dim, conv_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(conv_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(conv_dim, hidden_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        # --- Orientation head: hidden_dim→256→256→bins*2 ---
+        self.orientation = nn.Sequential(
+            nn.Linear(hidden_dim, 256), nn.ReLU(True), nn.Dropout(),
+            nn.Linear(256, 256), nn.ReLU(True), nn.Dropout(),
+            nn.Linear(256, bins * 2),
+        )
+
+        # --- Confidence head: hidden_dim→256→bins ---
+        self.confidence = nn.Sequential(
+            nn.Linear(hidden_dim, 256), nn.ReLU(True), nn.Dropout(),
+            nn.Linear(256, bins),
+        )
+
+        # --- Dimension head: hidden_dim→512→512→3 ---
+        self.dimension = nn.Sequential(
+            nn.Linear(hidden_dim, 512), nn.ReLU(True), nn.Dropout(),
+            nn.Linear(512, 512), nn.ReLU(True), nn.Dropout(),
+            nn.Linear(512, 3),
+        )
+
+        from evals.utils.geometric import KITTI_CLASS_DIMS, generate_bins
+        self.class_dims = torch.tensor(KITTI_CLASS_DIMS, dtype=torch.float32)
+        self.angle_bins = generate_bins(bins)
+
+        self.base_depth = base_depth
+        self.base_dims = base_dims
+
+    def forward(self, feats, boxes_2d_list):
+        """
+        Args:
+            feats:         (B, C, H_f, W_f) backbone dense features
+            boxes_2d_list: list of (N_i, 4) tensors [x1, y1, x2, y2] in IMAGE pixels
+
+        Returns:
+            orient: (N_total, bins, 2), conf: (N_total, bins), dim: (N_total, 3)
+        """
+        from torchvision.ops import RoIAlign
+
+        B, C, H_f, W_f = feats.shape
+        img_h, img_w = self.image_size
+        spatial_scale = H_f / img_h  # feature / image ratio
+
+        roi_boxes = []
+        for b in range(B):
+            for n in range(len(boxes_2d_list[b])):
+                x1, y1, x2, y2 = boxes_2d_list[b][n]
+                roi_boxes.append([
+                    float(b),
+                    float(x1) * spatial_scale,
+                    float(y1) * spatial_scale,
+                    float(x2) * spatial_scale,
+                    float(y2) * spatial_scale,
+                ])
+
+        if len(roi_boxes) == 0:
+            return (
+                torch.empty(0, self.bins, 2, device=feats.device),
+                torch.empty(0, self.bins, device=feats.device),
+                torch.empty(0, 3, device=feats.device),
+            )
+
+        roi = torch.tensor(roi_boxes, device=feats.device, dtype=torch.float32)
+        roi_align = RoIAlign(output_size=(7, 7), spatial_scale=1.0, sampling_ratio=2)
+        rois_feat = roi_align(feats, roi)  # (N, C, 7, 7)
+
+        x = self.conv_head(rois_feat)
+        x = self.pool(x).view(x.size(0), -1)
+
+        orientation = self.orientation(x)
+        orientation = orientation.view(-1, self.bins, 2)
+        orientation = torch.nn.functional.normalize(orientation, dim=2)
+
+        return orientation, self.confidence(x), self.dimension(x)
+
+    def decode_boxes(self, orient, conf, dim, box_2d_list, K_list, labels=None,
+                     true_argmax=None):
+        """
+        Decode predictions into 3D boxes — exact YOLO3D inference logic.
+
+        Args:
+            true_argmax: (N,) optional ground-truth bin indices.
+                         When provided, uses GT bin instead of model's argmax.
+                         Useful for overfit/debug experiments.
+        """
+        import numpy as np
+        from evals.utils.geometric import calc_location, generate_bins
+
+        device = orient.device
+        N = orient.size(0)
+        angle_bins = generate_bins(self.bins)
+
+        argmax = conf.argmax(dim=1) if true_argmax is None else true_argmax
+        orient_sel = orient[torch.arange(N), argmax]
+        cos_a, sin_a = orient_sel[:, 0], orient_sel[:, 1]
+        alpha_pred = torch.atan2(sin_a, cos_a)
+        alpha_pred = alpha_pred + torch.tensor(
+            [angle_bins[i] for i in argmax.tolist()], device=device
+        )
+        alpha_pred = alpha_pred - torch.pi
+
+        if labels is not None:
+            class_avg = self.class_dims.to(device)[labels]
+        else:
+            class_avg = self.class_dims.to(device).mean(dim=0, keepdim=True).expand(N, -1)
+        dims_pred = dim + class_avg
+
+        boxes_3d, scores = [], []
+
+        for i in range(N):
+            dim_np = dims_pred[i].cpu().numpy()
+            box_2d = box_2d_list[i]
+            if isinstance(box_2d, torch.Tensor):
+                box_2d = box_2d.cpu().tolist()
+            K = K_list[i]
+            if isinstance(K, torch.Tensor):
+                K = K.cpu().numpy()
+
+            fx, cx = float(K[0, 0]), float(K[0, 2])
+
+            P = np.zeros((3, 4), dtype=np.float64)
+            P[:3, :3] = K
+
+            box_2d_pairs = [(float(box_2d[0]), float(box_2d[1])),
+                           (float(box_2d[2]), float(box_2d[3]))]
+            u_center = (box_2d[0] + box_2d[2]) / 2.0
+            theta_ray = float(np.arctan2(u_center - cx, fx))
+
+            loc = calc_location(dim_np, P, box_2d_pairs, alpha_pred[i].item(), theta_ray)
+            orient_global = alpha_pred[i].item() + theta_ray
+
+            # calc_location returns center; get_3d_corners expects Y_bottom
+            Y_bottom = float(loc[1]) + float(dims_pred[i, 0]) / 2.0  # H = dims_pred[0]
+
+            box = torch.tensor([
+                float(loc[0]), Y_bottom, float(loc[2]),
+                float(dims_pred[i, 1]), float(dims_pred[i, 0]), float(dims_pred[i, 2]),
+                orient_global,
+            ], device=device)
+            boxes_3d.append(box)
+            scores.append(conf[i, argmax[i]])
+
+        if len(boxes_3d) == 0:
+            return (torch.empty((0, 7), device=device),
+                    torch.empty((0,), device=device),
+                    torch.empty((0,), dtype=torch.long, device=device))
+
+        return torch.stack(boxes_3d), torch.stack(scores), argmax
