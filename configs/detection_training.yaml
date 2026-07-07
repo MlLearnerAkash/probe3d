@@ -1,0 +1,13 @@
+system:
+  random_seed: 8
+  num_gpus: 1
+  port: 12355
+note: ""
+batch_size: 1
+stride: 14          # ViT patch size (14 for DINOv2-B/14)
+defaults:
+  - optimizer: ten_epoch
+  - backbone:  dinov2_l14 #dinov2_l14 OR tipsv2
+  - dataset: kitti
+  - probe: detection_probe
+  - _self_
