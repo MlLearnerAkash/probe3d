@@ -274,6 +274,927 @@ class MultiscaleHead(nn.Module):
 
 
 # ============================================================================
+# Detection Probe: Cube R-CNN / Omni3D style
+# Frozen backbone → Feature Extractor (DPT/Multiscale/Linear) →
+# Feature Pyramid → RPN → 2D Head + Cube Head
+# ============================================================================
+
+class FeaturePyramid(nn.Module):
+    """Build an FPN from a single dense feature map.
+
+    Takes a feature map at backbone stride and builds P2–P5 pyramid levels
+    via strided downsampling + top-down lateral fusion.
+    """
+
+    def __init__(self, in_dim, out_dim=256):
+        super().__init__()
+        # bottom-up pathway: P2 (input stride) → P3 → P4 → P5
+        self.p2_conv = nn.Conv2d(in_dim, out_dim, 3, padding=1)
+        self.p3_conv = nn.Conv2d(out_dim, out_dim, 3, padding=1)
+        self.p4_conv = nn.Conv2d(out_dim, out_dim, 3, padding=1)
+        self.p5_conv = nn.Conv2d(out_dim, out_dim, 3, padding=1)
+
+        # top-down laterals
+        self.lat_p5 = nn.Conv2d(out_dim, out_dim, 1)
+        self.lat_p4 = nn.Conv2d(out_dim, out_dim, 1)
+        self.lat_p3 = nn.Conv2d(out_dim, out_dim, 1)
+        self.lat_p2 = nn.Conv2d(out_dim, out_dim, 1)
+
+        # post-merge smoothing
+        self.smooth_p5 = nn.Conv2d(out_dim, out_dim, 3, padding=1)
+        self.smooth_p4 = nn.Conv2d(out_dim, out_dim, 3, padding=1)
+        self.smooth_p3 = nn.Conv2d(out_dim, out_dim, 3, padding=1)
+        self.smooth_p2 = nn.Conv2d(out_dim, out_dim, 3, padding=1)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, in_dim, H, W) dense features at backbone stride
+
+        Returns:
+            list of [P2, P3, P4, P5] each (B, out_dim, H_i, W_i)
+                P2: same as input
+                P3: 2x downsampled
+                P4: 4x downsampled
+                P5: 8x downsampled
+        """
+        # bottom-up
+        p2 = self.p2_conv(x).relu()   # stride = input_stride
+        p3 = self.p3_conv(F.max_pool2d(p2, 2, 2)).relu()
+        p4 = self.p4_conv(F.max_pool2d(p3, 2, 2)).relu()
+        p5 = self.p5_conv(F.max_pool2d(p4, 2, 2)).relu()
+
+        # top-down with lateral
+        p5_out = self.smooth_p5(self.lat_p5(p5))
+        p4_out = self.smooth_p4(self.lat_p4(p4) + interpolate(p5_out, scale_factor=2, mode="nearest"))
+        p3_out = self.smooth_p3(self.lat_p3(p3) + interpolate(p4_out, scale_factor=2, mode="nearest"))
+        p2_out = self.smooth_p2(self.lat_p2(p2) + interpolate(p3_out, scale_factor=2, mode="nearest"))
+
+        return [p2_out, p3_out, p4_out, p5_out]
+
+
+class RPNHead(nn.Module):
+    """Lightweight Region Proposal Network.
+
+    Shares convs across all FPN levels, predicts objectness + bbox deltas
+    for a single anchor scale per level.
+    """
+
+    def __init__(self, in_dim=256, num_anchors=1):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_dim, in_dim, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        # fixed anchor sizes per pyramid level (area in pixels at input resolution)
+        self.anchor_areas = [32 * 32, 64 * 64, 128 * 128, 256 * 256]
+        self.anchor_ratios = [0.5, 1.0, 2.0]
+        self.num_anchors = num_anchors * len(self.anchor_ratios)
+
+        self.obj_pred = nn.Conv2d(in_dim, self.num_anchors, 1)       # objectness logits
+        self.box_pred = nn.Conv2d(in_dim, self.num_anchors * 4, 1)   # (dx, dy, dw, dh)
+
+    def forward(self, feats):
+        """Return objectness logits and bbox deltas per pyramid level."""
+        obj_logits, box_deltas = [], []
+        for feat in feats:
+            f = self.conv(feat)
+            obj_logits.append(self.obj_pred(f))
+            box_deltas.append(self.box_pred(f))
+        return obj_logits, box_deltas
+
+    def generate_anchors(self, feats, image_size, feat_strides):
+        """
+        Generate anchor boxes for all pyramid levels.
+
+        Args:
+            feats: list of [P2, P3, P4, P5] feature maps
+            image_size: (H, W) input image size
+            feat_strides: list of strides for each level relative to image
+
+        Returns:
+            anchors: (N_total, 4) [x1, y1, x2, y2] in image coordinates
+        """
+        device = feats[0].device
+        anchors = []
+        for lvl, (feat, stride, area) in enumerate(zip(feats, feat_strides, self.anchor_areas)):
+            _, _, H_f, W_f = feat.shape
+            ys = torch.arange(H_f, device=device).float() * stride + stride / 2.0
+            xs = torch.arange(W_f, device=device).float() * stride + stride / 2.0
+            y_grid, x_grid = torch.meshgrid(ys, xs, indexing="ij")
+
+            for ratio in self.anchor_ratios:
+                w = (area / ratio) ** 0.5
+                h = w * ratio
+                x1 = x_grid - w / 2
+                y1 = y_grid - h / 2
+                x2 = x_grid + w / 2
+                y2 = y_grid + h / 2
+                anchors.append(torch.stack([x1, y1, x2, y2], dim=-1).reshape(-1, 4))
+
+        return torch.cat(anchors, dim=0)
+
+    def decode_proposals(self, obj_logits, box_deltas, feats,
+                         image_size, feat_strides,
+                         pre_nms_topk=1000, post_nms_topk=100,
+                         nms_thresh=0.7, score_thresh=0.05):
+        """Decode RPN outputs into proposal boxes via NMS."""
+        device = feats[0].device
+        img_h, img_w = image_size
+        proposals, scores_all = [], []
+
+        for lvl, (obj, delta, feat, stride) in enumerate(
+            zip(obj_logits, box_deltas, feats, feat_strides)
+        ):
+            _, _, H_f, W_f = feat.shape
+            obj_scores = obj.sigmoid().permute(0, 2, 3, 1).reshape(H_f, W_f, -1)  # (H_f, W_f, nA)
+            deltas = delta.permute(0, 2, 3, 1).reshape(H_f, W_f, -1, 4)  # (H_f, W_f, nA, 4)
+
+            ys = torch.arange(H_f, device=device).float() * stride + stride / 2.0
+            xs = torch.arange(W_f, device=device).float() * stride + stride / 2.0
+            y_grid, x_grid = torch.meshgrid(ys, xs, indexing="ij")
+
+            for a, ratio in enumerate(self.anchor_ratios):
+                area = self.anchor_areas[lvl]
+                aw = (area / ratio) ** 0.5
+                ah = aw * ratio
+                dx = deltas[:, :, a, 0]
+                dy = deltas[:, :, a, 1]
+                dw = deltas[:, :, a, 2]
+                dh = deltas[:, :, a, 3]
+                cx = x_grid + dx * aw
+                cy = y_grid + dy * ah
+                w = aw * dw.exp()
+                h = ah * dh.exp()
+
+                x1 = (cx - w / 2).clamp(0, img_w)
+                y1 = (cy - h / 2).clamp(0, img_h)
+                x2 = (cx + w / 2).clamp(0, img_w)
+                y2 = (cy + h / 2).clamp(0, img_h)
+
+                valid = (x2 > x1) & (y2 > y1)
+                proposals.append(torch.stack([x1, y1, x2, y2], dim=-1).reshape(-1, 4)[valid.reshape(-1)])
+                scores_all.append(obj_scores[:, :, a].reshape(-1)[valid.reshape(-1)])
+
+        if len(proposals) == 0:
+            return torch.empty((0, 4), device=device), torch.empty((0,), device=device)
+
+        proposals = torch.cat(proposals, dim=0)
+        scores_all = torch.cat(scores_all, dim=0)
+
+        # pre-NMS top-k
+        keep = scores_all.argsort(descending=True)[:pre_nms_topk]
+        proposals = proposals[keep]
+        scores_all = scores_all[keep]
+
+        # NMS
+        keep = torchvision_nms(proposals, scores_all, nms_thresh)
+        keep = keep[:post_nms_topk]
+
+        return proposals[keep], scores_all[keep]
+
+    def match_anchors_to_gt(self, anchors, gt_boxes_list, pos_iou=0.7, neg_iou=0.3):
+        """Match anchors to ground-truth boxes. Returns labels and regression targets."""
+        device = anchors.device
+        N = len(anchors)
+        # flatten GT boxes across batch
+        gt_all = []
+        batch_indices = []
+        for b, boxes in enumerate(gt_boxes_list):
+            if boxes.numel() > 0:
+                gt_all.append(boxes)
+                batch_indices.extend([b] * len(boxes))
+
+        if len(gt_all) == 0:
+            labels = torch.zeros(N, device=device, dtype=torch.long)
+            bbox_targets = torch.zeros(N, 4, device=device)
+            return labels, bbox_targets
+
+        gt_all = torch.cat(gt_all, dim=0)
+        batch_indices_t = torch.tensor(batch_indices, device=device)
+
+        # compute IoU between anchors and all GT boxes
+        # anchors: (N, 4) [x1, y1, x2, y2]; gt_all: (M, 4)
+        ious = box_iou(anchors, gt_all)  # (N, M)
+        max_iou, max_idx = ious.max(dim=1)  # (N,)
+
+        labels = torch.zeros(N, device=device, dtype=torch.long)
+        labels[max_iou >= pos_iou] = 1
+
+        # also mark the best anchor per GT as positive
+        best_anchor_per_gt = ious.argmax(dim=0)
+        labels[best_anchor_per_gt] = 1
+
+        # regression targets for positive anchors
+        bbox_targets = torch.zeros(N, 4, device=device)
+        pos_mask = labels == 1
+        if pos_mask.any():
+            matched_gt = gt_all[max_idx[pos_mask]]
+            anc = anchors[pos_mask]
+            anc_cx = (anc[:, 0] + anc[:, 2]) / 2.0
+            anc_cy = (anc[:, 1] + anc[:, 3]) / 2.0
+            anc_w = anc[:, 2] - anc[:, 0]
+            anc_h = anc[:, 3] - anc[:, 1]
+            gt_cx = (matched_gt[:, 0] + matched_gt[:, 2]) / 2.0
+            gt_cy = (matched_gt[:, 1] + matched_gt[:, 3]) / 2.0
+            gt_w = matched_gt[:, 2] - matched_gt[:, 0]
+            gt_h = matched_gt[:, 3] - matched_gt[:, 1]
+            bbox_targets[pos_mask, 0] = (gt_cx - anc_cx) / anc_w.clamp(min=1)
+            bbox_targets[pos_mask, 1] = (gt_cy - anc_cy) / anc_h.clamp(min=1)
+            bbox_targets[pos_mask, 2] = (gt_w / anc_w.clamp(min=1)).log()
+            bbox_targets[pos_mask, 3] = (gt_h / anc_h.clamp(min=1)).log()
+
+        return labels, bbox_targets
+
+
+def torchvision_nms(boxes, scores, iou_threshold):
+    """Simple NMS implementation (no torchvision dependency)."""
+    if len(boxes) == 0:
+        return torch.empty(0, dtype=torch.long, device=boxes.device)
+
+    # sort by score descending
+    order = scores.argsort(descending=True)
+    keep = []
+    while order.numel() > 0:
+        idx = order[0].item()
+        keep.append(idx)
+        if order.numel() == 1:
+            break
+        ious = box_iou(boxes[order[1:]], boxes[idx:idx + 1]).squeeze(1)
+        mask = ious <= iou_threshold
+        order = order[1:][mask]
+    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
+
+
+def box_iou(boxes1, boxes2):
+    """Compute pairwise IoU between two sets of boxes [x1, y1, x2, y2]."""
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+
+    iou = inter / (area1[:, None] + area2 - inter + 1e-6)
+    return iou
+
+
+class Box2DHead(nn.Module):
+    """Fast R-CNN style 2D box head (per-class box regression + classification)."""
+
+    def __init__(self, in_dim=256, num_classes=3, hidden_dim=1024):
+        super().__init__()
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim), nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True),
+        )
+        self.cls_score = nn.Linear(hidden_dim, num_classes + 1)  # +1 background
+        self.bbox_pred = nn.Linear(hidden_dim, num_classes * 4)
+
+    def forward(self, x):
+        """x: (N, in_dim, H_roi, W_roi) RoIAlign features."""
+        x = self.avgpool(x).flatten(1)
+        x = self.fc(x)
+        scores = self.cls_score(x)      # (N, num_classes+1)
+        bbox_deltas = self.bbox_pred(x)  # (N, num_classes*4)
+        return scores, bbox_deltas
+
+
+class CubeHead3D(nn.Module):
+    """Cube R-CNN style 3D cuboid prediction head.
+
+    Predicts per-class: 2D center offset, depth Z, dimensions (W, H, L),
+    and 6D continuous pose representation.
+    """
+
+    def __init__(self, in_dim=256, num_classes=3, hidden_dim=1024,
+                 z_type="log", pose_type="6d", dims_prior=None):
+        super().__init__()
+        self.num_classes = num_classes
+        self.z_type = z_type
+        self.pose_type = pose_type
+
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim), nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True),
+        )
+
+        # per-class predictions
+        self.xy_pred = nn.Linear(hidden_dim, num_classes * 2)     # 2D center offset
+        self.z_pred = nn.Linear(hidden_dim, num_classes * 1)      # depth Z
+        self.dims_pred = nn.Linear(hidden_dim, num_classes * 3)   # (W, H, L) log offsets
+        self.pose_pred = nn.Linear(hidden_dim, num_classes * 6)   # 6D rotation
+
+        # optional dims prior [num_classes, 3]: (W, H, L) in meters
+        self.has_dims_prior = dims_prior is not None
+        if self.has_dims_prior:
+            self.register_buffer("dims_prior", torch.tensor(dims_prior, dtype=torch.float32))
+
+    def forward(self, x):
+        """x: (N, in_dim, H_roi, W_roi) RoIAlign features."""
+        n = x.size(0)
+        x = self.avgpool(x).flatten(1)
+        x = self.fc(x)
+
+        xy = self.xy_pred(x).view(n, self.num_classes, 2)
+        z = self.z_pred(x).view(n, self.num_classes, 1)
+        dims = self.dims_pred(x).view(n, self.num_classes, 3)
+        pose = self.pose_pred(x).view(n, self.num_classes, 6)
+
+        return xy, z, dims, pose
+
+    def decode_3d(self, xy, z, dims, pose, proposals, K, class_ids, image_size):
+        """
+        Decode cube head outputs into 3D boxes.
+
+        Args:
+            xy: (N, 2) predicted 2D center offset in proposal coords
+            z:  (N,) predicted depth
+            dims: (N, 3) predicted dimensions (W, H, L)
+            pose: (N, 6) 6D rotation
+            proposals: (N, 4) [x1, y1, x2, y2] proposal boxes (image pixels)
+            K: (3, 3) camera intrinsics
+            class_ids: (N,) class indices
+            image_size: (H, W) of input image
+
+        Returns:
+            boxes_3d: (N, 7) [X, Y, Z, W, H, L, theta] camera coordinates
+        """
+        device = xy.device
+        N = xy.size(0)
+        img_h, img_w = image_size
+
+        # 2D center in image coords
+        prop_cx = (proposals[:, 0] + proposals[:, 2]) / 2.0
+        prop_cy = (proposals[:, 1] + proposals[:, 3]) / 2.0
+        prop_w = proposals[:, 2] - proposals[:, 0]
+        prop_h = proposals[:, 3] - proposals[:, 1]
+
+        cx_pred = prop_cx + xy[:, 0] * prop_w
+        cy_pred = prop_cy + xy[:, 1] * prop_h
+
+        # decode depth Z
+        if self.z_type == "log":
+            z_pred = z.exp()
+        elif self.z_type == "sigmoid":
+            z_pred = z.sigmoid() * 100
+        else:
+            z_pred = z
+
+        z_pred = z_pred.clamp(min=0.1, max=80.0)
+
+        # back-project to 3D
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+        X = (cx_pred - cx) * z_pred / fx
+        Y = (cy_pred - cy) * z_pred / fy
+
+        # decode dimensions
+        if self.has_dims_prior:
+            prior = self.dims_prior[class_ids]  # (N, 3)
+            W_box = dims[:, 0].exp() * prior[:, 0]
+            H_box = dims[:, 1].exp() * prior[:, 1]
+            L_box = dims[:, 2].exp() * prior[:, 2]
+        else:
+            W_box = dims[:, 0].exp()
+            H_box = dims[:, 1].exp()
+            L_box = dims[:, 2].exp()
+
+        # decode 6D rotation → global yaw
+        R = rotation_6d_to_matrix(pose)  # (N, 3, 3)
+
+        # Compute yaw (rotation around Y-axis in camera frame)
+        # R[:, 0, 0] = cos(θ), R[:, 0, 2] = sin(θ)
+        theta_global = torch.atan2(R[:, 0, 2], R[:, 0, 0])
+
+        boxes_3d = torch.stack([X, Y, z_pred, W_box, H_box, L_box, theta_global], dim=-1)
+        return boxes_3d
+
+
+# ---------------------------------------------------------------------------
+# 6D rotation → rotation matrix (pytorch3d port, self-contained)
+# ---------------------------------------------------------------------------
+@torch.jit.script
+def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
+    """Convert 6D rotation representation to 3x3 rotation matrix.
+
+    From Zhou et al., "On the Continuity of Rotation Representations in Neural Networks",
+    CVPR 2019.
+    """
+    a1, a2 = d6[..., :3], d6[..., 3:]
+    b1 = F.normalize(a1, dim=-1)
+    b2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
+    b2 = F.normalize(b2, dim=-1)
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack((b1, b2, b3), dim=-1)
+
+
+class DetectionProbe(nn.Module):
+    """Full detection probe: Feature Extractor → FPN → RPN → 2D Head + Cube Head.
+
+    Follows the Cube R-CNN / Omni3D paradigm:
+    1. Frozen backbone produces multi-block features
+    2. DPT/MultiscaleHead/Linear projects features into a dense feature map
+    3. Feature Pyramid (P2–P5) is built from that map
+    4. RPN generates region proposals
+    5. RoIAlign pools features per proposal
+    6. 2D head predicts class + refined 2D box
+    7. Cube head predicts 3D cuboid (center_2d_offset, Z, dims, pose)
+
+    Args:
+        feat_dim:    backbone feature dimensions (list of 4 ints or single int)
+        num_classes: number of object classes (default 3 for KITTI: Car, Ped, Cyclist)
+        head_type:   feature extraction head ("dpt", "multiscale", or "linear")
+        hidden_dim:  hidden dimension for feature extraction head
+        fpn_dim:     FPN output dimension
+        kernel_size: conv kernel size for feature extractor
+        image_size:  (H, W) input image size for stride computation
+        dims_prior:  [num_classes, 3] class-average dimensions (W, H, L)
+    """
+
+    def __init__(
+        self,
+        feat_dim,
+        num_classes=3,
+        head_type="dpt",
+        hidden_dim=512,
+        fpn_dim=256,
+        kernel_size=1,
+        image_size=None,
+        dims_prior=None,
+        # unused; kept for config compatibility
+        min_depth=None,
+        max_depth=None,
+        base_depth=None,
+        base_dims=None,
+        bins=None,
+        conv_dim=None,
+        checkpoint_path=None,
+    ):
+        super().__init__()
+
+        self.name = f"detection_{head_type}"
+        self.num_classes = num_classes
+        self.image_size = image_size or (384, 1280)
+        self.fpn_dim = fpn_dim
+
+        # Normalize feat_dim: DPT/MultiscaleHead expect a list of 4 ints.
+        # Backbones like DINO (dense-cls) provide a list; TIPSv2 provides a single int.
+        if isinstance(feat_dim, int):
+            feat_dim = [feat_dim] * 4
+
+        # 1. Feature extractor: DPT / MultiscaleHead / Linear
+        if head_type == "dpt":
+            self.feat_extractor = DPT(feat_dim, fpn_dim, hidden_dim, kernel_size)
+        elif head_type == "multiscale":
+            self.feat_extractor = MultiscaleHead(feat_dim, fpn_dim, hidden_dim, kernel_size)
+        elif head_type == "linear":
+            self.feat_extractor = Linear(feat_dim, fpn_dim, kernel_size)
+        else:
+            raise ValueError(f"Unknown head_type: {head_type}")
+
+        # 2. Feature Pyramid
+        self.fpn = FeaturePyramid(fpn_dim, fpn_dim)
+
+        # 3. RPN
+        self.rpn = RPNHead(fpn_dim, num_anchors=1)
+
+        # 4. RoIAlign pooler (parameter-free, constructed per call)
+        self.roi_output_size = 7
+
+        # 5. 2D Box Head
+        self.box_head = Box2DHead(fpn_dim, num_classes)
+
+        # 6. Cube Head — use KITTI dims prior if none provided
+        if dims_prior is None:
+            dims_prior = [
+                [1.60, 1.53, 3.90],   # Car    (W, H, L)
+                [0.60, 1.75, 0.80],   # Pedestrian
+                [0.60, 1.75, 1.80],   # Cyclist
+            ]
+        self.cube_head = CubeHead3D(fpn_dim, num_classes, dims_prior=dims_prior)
+
+        # image-level strides for each FPN level (relative to image_size)
+        feat_stride = self._compute_stride(feat_dim)
+        self.feat_strides = [
+            feat_stride,          # P2
+            feat_stride * 2,      # P3
+            feat_stride * 4,      # P4
+            feat_stride * 8,      # P5
+        ]
+
+    def _compute_stride(self, feat_dim):
+        """Estimate backbone stride from image size and feature dimensions."""
+        # For ViT backbones, stride ≈ patch_size
+        # We approximate: stride = image_h / feature_h
+        # But since we don't know feature_h at init, use a heuristic
+        return 14  # default ViT patch size; overridden during forward
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def _roi_align(self, features, proposals, output_size=7):
+        """Simple RoIAlign: crop + interpolate from the feature map.
+
+        Args:
+            features: (B, C, H_f, W_f) or single feature map
+            proposals: list of (N_i, 4) tensors [x1, y1, x2, y2] in image coords
+
+        Returns:
+            (N_total, C, output_size, output_size)
+        """
+        from torchvision.ops import RoIAlign
+
+        if isinstance(features, list):
+            features = features[0]  # use P2 for RoIAlign
+
+        B, C, H_f, W_f = features.shape
+        img_h, img_w = self.image_size
+        spatial_scale = H_f / img_h
+
+        roi_boxes = []
+        for b in range(B if B > 0 else 1):
+            if b < len(proposals):
+                for box in proposals[b]:
+                    x1, y1, x2, y2 = box
+                    roi_boxes.append([
+                        float(b),
+                        float(x1) * spatial_scale,
+                        float(y1) * spatial_scale,
+                        float(x2) * spatial_scale,
+                        float(y2) * spatial_scale,
+                    ])
+
+        if len(roi_boxes) == 0:
+            return torch.empty(0, C, output_size, output_size, device=features.device)
+
+        roi = torch.tensor(roi_boxes, device=features.device, dtype=torch.float32)
+        roi_align = RoIAlign(output_size=(output_size, output_size),
+                             spatial_scale=1.0, sampling_ratio=2)
+        return roi_align(features, roi)
+
+    def forward(self, feats, targets=None, K=None):
+        """
+        Args:
+            feats: backbone features (single tensor or list)
+            targets: list of dicts with 'boxes_2d', 'labels', 'boxes_3d' per image
+            K: (B, 3, 3) camera intrinsics
+
+        Returns (training):
+            loss_dict: dict of scalar losses
+
+        Returns (inference):
+            results: list of dicts with 'boxes_3d', 'scores', 'labels' per image
+        """
+        # Normalize: DPT/MultiscaleHead expect a list of 4 feature maps.
+        # Backbones like TIPSv2 return a single tensor; DINO dense-cls returns a list.
+        if isinstance(feats, torch.Tensor):
+            feats = [feats] * 4
+
+        # 1. Feature extraction
+        extracted = self.feat_extractor(feats)  # (B, fpn_dim, H, W)
+
+        # 2. Feature Pyramid
+        pyramid = self.fpn(extracted)  # [P2, P3, P4, P5]
+
+        # 3. RPN forward
+        obj_logits, box_deltas = self.rpn(pyramid)
+        anchors = self.rpn.generate_anchors(pyramid, self.image_size, self.feat_strides)
+
+        if self.training and targets is not None:
+            return self._forward_train(pyramid, obj_logits, box_deltas, anchors,
+                                       targets, K)
+        else:
+            return self._forward_inference(pyramid, obj_logits, box_deltas, anchors, K)
+
+    def _forward_train(self, pyramid, obj_logits, box_deltas, anchors, targets, K):
+        """Training forward pass with RPN + 2D head + cube head losses."""
+        device = self.device
+        B = len(targets)
+
+        losses = {}
+
+        # --- RPN loss ---
+        gt_boxes_2d_list = [t["boxes_2d"].to(device) for t in targets]
+        rpn_labels, rpn_bbox_targets = self.rpn.match_anchors_to_gt(anchors, gt_boxes_2d_list)
+
+        # flatten all RPN outputs for loss
+        na = self.rpn.num_anchors
+        obj_logits_flat = torch.cat([o.permute(0, 2, 3, 1).reshape(-1) for o in obj_logits], dim=0)
+        box_deltas_flat = torch.cat([b.permute(0, 2, 3, 1).reshape(-1, 4) for b in box_deltas], dim=0)
+
+        # objectness loss (binary cross entropy)
+        num_pos = rpn_labels.sum().clamp(min=1)
+        num_neg = (rpn_labels == 0).sum().clamp(min=1)
+        pos_mask = rpn_labels == 1
+        neg_mask = rpn_labels == 0
+
+        # sample negatives for balance
+        neg_indices = neg_mask.nonzero(as_tuple=True)[0]
+        if len(neg_indices) > num_pos * 3:
+            neg_indices = neg_indices[torch.randperm(len(neg_indices), device=device)[:num_pos * 3]]
+            neg_mask = torch.zeros_like(neg_mask)
+            neg_mask[neg_indices] = True
+
+        obj_loss_pos = F.binary_cross_entropy_with_logits(
+            obj_logits_flat[pos_mask],
+            torch.ones(pos_mask.sum(), device=device)
+        )
+        obj_loss_neg = F.binary_cross_entropy_with_logits(
+            obj_logits_flat[neg_mask],
+            torch.zeros(neg_mask.sum(), device=device)
+        )
+        losses["loss_rpn_obj"] = (obj_loss_pos + obj_loss_neg)
+
+        # box regression loss (smooth L1 on positive anchors)
+        if pos_mask.any():
+            rpn_box_loss = F.smooth_l1_loss(
+                box_deltas_flat[pos_mask],
+                rpn_bbox_targets[pos_mask],
+                beta=0.11,
+            )
+            losses["loss_rpn_box"] = rpn_box_loss
+        else:
+            losses["loss_rpn_box"] = torch.tensor(0.0, device=device)
+
+        # --- Generate proposals for 2D head training ---
+        # Use GT boxes as "proposals" during training (simpler, more stable)
+        # Collect all GT 2D boxes
+        all_proposals = []
+        all_gt_labels = []
+        all_gt_boxes_2d = []
+        all_gt_boxes_3d = []
+        all_K = []
+        batch_indices_for_boxes = []
+
+        for b, t in enumerate(targets):
+            gt2d = t["boxes_2d"].to(device)
+            gt_labels_b = t["labels"].to(device)
+            gt3d = t["boxes_3d"].to(device) if "boxes_3d" in t else None
+
+            if gt2d.numel() == 0:
+                continue
+
+            all_proposals.append(gt2d)
+            all_gt_labels.append(gt_labels_b)
+            all_gt_boxes_2d.append(gt2d)
+            if gt3d is not None and gt3d.numel() > 0:
+                all_gt_boxes_3d.append(gt3d)
+            all_K.append(K[b] if K is not None else torch.eye(3, device=device))
+
+            batch_indices_for_boxes.extend([b] * len(gt2d))
+
+        if len(all_proposals) == 0:
+            losses["loss_box_cls"] = torch.tensor(0.0, device=device)
+            losses["loss_box_reg"] = torch.tensor(0.0, device=device)
+            losses["loss_cube_xy"] = torch.tensor(0.0, device=device)
+            losses["loss_cube_z"] = torch.tensor(0.0, device=device)
+            losses["loss_cube_dims"] = torch.tensor(0.0, device=device)
+            losses["loss_cube_pose"] = torch.tensor(0.0, device=device)
+            return losses
+
+        all_proposals_t = torch.cat(all_proposals, dim=0)
+        all_gt_labels_t = torch.cat(all_gt_labels, dim=0)
+
+        # RoIAlign features
+        roi_feats = self._roi_align(pyramid,
+                                     [all_proposals_t],  # single batch with all boxes
+                                     self.roi_output_size)
+        # Actually, we need per-image handling. Let's simplify:
+        # Use pyramid[0] (P2) directly and RoIAlign with all proposals in one batch
+        roi_proposals = []
+        for b in range(B):
+            if b < len(targets) and targets[b]["boxes_2d"].numel() > 0:
+                roi_proposals.append(targets[b]["boxes_2d"].to(device))
+            else:
+                roi_proposals.append(torch.empty((0, 4), device=device))
+
+        roi_feats = self._roi_align(pyramid, roi_proposals, self.roi_output_size)
+        if roi_feats.numel() == 0:
+            losses["loss_box_cls"] = torch.tensor(0.0, device=device)
+            losses["loss_box_reg"] = torch.tensor(0.0, device=device)
+            losses["loss_cube_xy"] = torch.tensor(0.0, device=device)
+            losses["loss_cube_z"] = torch.tensor(0.0, device=device)
+            losses["loss_cube_dims"] = torch.tensor(0.0, device=device)
+            losses["loss_cube_pose"] = torch.tensor(0.0, device=device)
+            return losses
+
+        # 2D Box Head
+        cls_scores, bbox_deltas = self.box_head(roi_feats)
+
+        # 2D box loss
+        cls_targets = all_gt_labels_t.clamp(max=self.num_classes - 1)
+        losses["loss_box_cls"] = F.cross_entropy(cls_scores, cls_targets)
+
+        # Box regression targets (per-class, select GT class)
+        gt_boxes_2d_all = torch.cat(all_gt_boxes_2d, dim=0)
+        prop_boxes_2d_all = gt_boxes_2d_all.clone()  # proposals == GT boxes during training
+        prop_cx = (prop_boxes_2d_all[:, 0] + prop_boxes_2d_all[:, 2]) / 2
+        prop_cy = (prop_boxes_2d_all[:, 1] + prop_boxes_2d_all[:, 3]) / 2
+        prop_w = prop_boxes_2d_all[:, 2] - prop_boxes_2d_all[:, 0]
+        prop_h = prop_boxes_2d_all[:, 3] - prop_boxes_2d_all[:, 1]
+        gt_cx = (gt_boxes_2d_all[:, 0] + gt_boxes_2d_all[:, 2]) / 2
+        gt_cy = (gt_boxes_2d_all[:, 1] + gt_boxes_2d_all[:, 3]) / 2
+        gt_w = gt_boxes_2d_all[:, 2] - gt_boxes_2d_all[:, 0]
+        gt_h = gt_boxes_2d_all[:, 3] - gt_boxes_2d_all[:, 1]
+
+        box_targets = torch.stack([
+            (gt_cx - prop_cx) / prop_w.clamp(min=1),
+            (gt_cy - prop_cy) / prop_h.clamp(min=1),
+            (gt_w / prop_w.clamp(min=1)).log(),
+            (gt_h / prop_h.clamp(min=1)).log(),
+        ], dim=1)  # (N, 4)
+
+        # select per-class predictions
+        N_roi = cls_targets.size(0)
+        bbox_deltas_per_cls = bbox_deltas.view(N_roi, self.num_classes, 4)
+        bbox_pred_sel = bbox_deltas_per_cls[torch.arange(N_roi), cls_targets]
+        losses["loss_box_reg"] = F.smooth_l1_loss(bbox_pred_sel, box_targets, beta=0.11)
+
+        # Cube Head
+        xy, z, dims, pose = self.cube_head(roi_feats)
+
+        # select per-class cube predictions
+        xy_sel = xy[torch.arange(N_roi), cls_targets]    # (N, 2)
+        z_sel = z[torch.arange(N_roi), cls_targets].squeeze(-1)  # (N,)
+        dims_sel = dims[torch.arange(N_roi), cls_targets]  # (N, 3)
+        pose_sel = pose[torch.arange(N_roi), cls_targets]  # (N, 6)
+
+        # Cube losses
+        # Z loss: log-depth
+        if len(all_gt_boxes_3d) > 0:
+            gt_boxes_3d_all = torch.cat(all_gt_boxes_3d, dim=0)
+            gt_z = gt_boxes_3d_all[:, 2]
+            gt_dims_3d = gt_boxes_3d_all[:, 3:6]  # (W, H, L)
+            gt_theta = gt_boxes_3d_all[:, 6]
+
+            losses["loss_cube_z"] = F.smooth_l1_loss(z_sel, gt_z.log(), beta=0.11)
+
+            # Dims loss: log offsets
+            if self.cube_head.has_dims_prior:
+                prior = self.cube_head.dims_prior[cls_targets]
+                dims_target = (gt_dims_3d / prior.clamp(min=1e-6)).log()
+            else:
+                dims_target = gt_dims_3d.log()
+            losses["loss_cube_dims"] = F.smooth_l1_loss(dims_sel, dims_target, beta=0.11)
+
+            # Pose loss: 6D rotation → 3x3 → geodesic angle
+            # Compute predicted rotation
+            R_pred = rotation_6d_to_matrix(pose_sel)  # (N, 3, 3)
+            # GT rotation: yaw around Y-axis → 3x3 matrix
+            cos_t, sin_t = gt_theta.cos(), gt_theta.sin()
+            zeros = torch.zeros_like(cos_t)
+            ones = torch.ones_like(cos_t)
+            R_gt = torch.stack([
+                torch.stack([cos_t, zeros, sin_t], dim=-1),
+                torch.stack([zeros, ones, zeros], dim=-1),
+                torch.stack([-sin_t, zeros, cos_t], dim=-1),
+            ], dim=-2)  # (N, 3, 3)
+
+            # geodesic distance: arccos((trace(R_pred^T R_gt) - 1) / 2)
+            R_rel = torch.bmm(R_pred.transpose(1, 2), R_gt)
+            trace = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
+            cos_angle = ((trace - 1) / 2).clamp(-1, 1)
+            angle = torch.acos(cos_angle)
+            losses["loss_cube_pose"] = angle.mean()
+
+            # XY loss: 2D center offset (same as 2D box head regression)
+            losses["loss_cube_xy"] = F.smooth_l1_loss(xy_sel, box_targets[:, :2], beta=0.11)
+        else:
+            losses["loss_cube_z"] = torch.tensor(0.0, device=device)
+            losses["loss_cube_dims"] = torch.tensor(0.0, device=device)
+            losses["loss_cube_pose"] = torch.tensor(0.0, device=device)
+            losses["loss_cube_xy"] = torch.tensor(0.0, device=device)
+
+        return losses
+
+    def _forward_inference(self, pyramid, obj_logits, box_deltas, anchors, K):
+        """Inference forward pass: RPN proposals → 2D head → cube head → 3D boxes."""
+        device = self.device
+
+        # Generate proposals from RPN
+        proposals, rpn_scores = self.rpn.decode_proposals(
+            obj_logits, box_deltas, pyramid,
+            self.image_size, self.feat_strides,
+            pre_nms_topk=1000, post_nms_topk=50,
+            nms_thresh=0.7, score_thresh=0.05,
+        )
+
+        B = pyramid[0].size(0) if K is not None else 1
+        if K is None:
+            K = torch.eye(3, device=device).unsqueeze(0).expand(B, -1, -1)
+
+        results = []
+        for b in range(B):
+            if proposals.numel() == 0:
+                results.append({
+                    "boxes_3d": torch.empty((0, 7), device=device),
+                    "scores": torch.empty((0,), device=device),
+                    "labels": torch.empty((0,), dtype=torch.long, device=device),
+                })
+                continue
+
+            # RoIAlign for all proposals
+            roi_feats = self._roi_align(
+                [pyramid[0][b:b+1]],  # single image
+                [proposals],
+                self.roi_output_size,
+            )
+
+            if roi_feats.numel() == 0:
+                results.append({
+                    "boxes_3d": torch.empty((0, 7), device=device),
+                    "scores": torch.empty((0,), device=device),
+                    "labels": torch.empty((0,), dtype=torch.long, device=device),
+                })
+                continue
+
+            # 2D head
+            cls_scores, bbox_deltas = self.box_head(roi_feats)
+            cls_probs = cls_scores.softmax(dim=-1)
+            scores, class_ids = cls_probs[:, 1:].max(dim=1)  # skip background
+            class_ids = class_ids + 1  # back to 0-indexed class
+
+            # filter background
+            fg_mask = class_ids < self.num_classes  # 0 is bg, so valid classes are 1-3
+            # but we skipped bg above, so everything is fg. Just filter low scores.
+            keep_mask = scores > 0.1
+            if keep_mask.sum() == 0:
+                results.append({
+                    "boxes_3d": torch.empty((0, 7), device=device),
+                    "scores": torch.empty((0,), device=device),
+                    "labels": torch.empty((0,), dtype=torch.long, device=device),
+                })
+                continue
+
+            scores = scores[keep_mask]
+            class_ids = class_ids[keep_mask]
+            prop_kept = proposals[keep_mask]
+            roi_feats_kept = roi_feats[keep_mask]
+
+            # Refine 2D boxes
+            bbox_d = bbox_deltas[keep_mask].view(-1, self.num_classes, 4)
+            bbox_d_sel = bbox_d[torch.arange(keep_mask.sum()), class_ids]
+
+            prop_cx = (prop_kept[:, 0] + prop_kept[:, 2]) / 2
+            prop_cy = (prop_kept[:, 1] + prop_kept[:, 3]) / 2
+            prop_w = prop_kept[:, 2] - prop_kept[:, 0]
+            prop_h = prop_kept[:, 3] - prop_kept[:, 1]
+
+            cx_refined = prop_cx + bbox_d_sel[:, 0] * prop_w
+            cy_refined = prop_cy + bbox_d_sel[:, 1] * prop_h
+            w_refined = prop_w * bbox_d_sel[:, 2].exp()
+            h_refined = prop_h * bbox_d_sel[:, 3].exp()
+
+            refined_boxes = torch.stack([
+                cx_refined - w_refined / 2,
+                cy_refined - h_refined / 2,
+                cx_refined + w_refined / 2,
+                cy_refined + h_refined / 2,
+            ], dim=1)
+
+            # Cube head
+            xy, z, dims, pose = self.cube_head(roi_feats_kept)
+            xy_sel = xy[torch.arange(keep_mask.sum()), class_ids]
+            z_sel = z[torch.arange(keep_mask.sum()), class_ids].squeeze(-1)
+            dims_sel = dims[torch.arange(keep_mask.sum()), class_ids]
+            pose_sel = pose[torch.arange(keep_mask.sum()), class_ids]
+
+            boxes_3d = self.cube_head.decode_3d(
+                xy_sel, z_sel, dims_sel, pose_sel,
+                refined_boxes, K[b], class_ids, self.image_size,
+            )
+
+            # Per-class NMS on final detections (using refined 2D boxes)
+            keep_all = []
+            for c in range(self.num_classes):
+                c_mask = class_ids == c
+                if c_mask.sum() == 0:
+                    continue
+                idx_c = c_mask.nonzero(as_tuple=True)[0]
+                keep_c = torchvision_nms(refined_boxes[idx_c], scores[idx_c], 0.5)
+                keep_all.append(idx_c[keep_c])
+
+            if keep_all:
+                keep = torch.cat(keep_all, dim=0)
+                boxes_3d = boxes_3d[keep]
+                scores = scores[keep]
+                class_ids = class_ids[keep]
+
+            results.append({
+                "boxes_3d": boxes_3d,
+                "scores": scores,
+                "labels": class_ids,
+            })
+
+        return results
+
+
+# ============================================================================
 # FCOS3D-style 3D Bounding Box Probe (mmdet3d anchor_free_mono3d_head)
 # ============================================================================
 

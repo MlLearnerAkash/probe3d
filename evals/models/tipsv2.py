@@ -1045,8 +1045,12 @@ class TIPS(nn.Module):
     
     feat_dim = embed_dim * 2 if output == "dense-cls" else embed_dim
     ml = [depth // 4 - 1, depth // 2 - 1, depth * 3 // 4 - 1, depth - 1]
-    self.feat_dim = feat_dim
-    self.multilayers = [ml[-1] if layer == -1 else layer]
+    if output == "dense-cls":
+        self.multilayers = ml
+        self.feat_dim = [feat_dim] * 4
+    else:
+        self.multilayers = [ml[-1] if layer == -1 else layer]
+        self.feat_dim = feat_dim
     self.layer = "-".join(str(x) for x in self.multilayers)
 
 

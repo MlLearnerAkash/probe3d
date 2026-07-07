@@ -129,9 +129,9 @@ class KITTIDataset(torch.utils.data.Dataset):
             self._hf_split = "train"
             self._has_labels = True
             if split == "train":
-                self._start, self._end = 0, 3712
+                self._start, self._end = 0, 500#0, 3712
             elif split == "valid":
-                self._start, self._end = 3712, 7481
+                self._start, self._end = 0, 500#3712, 7481
             else:
                 self._start, self._end = 0, 7481
 
